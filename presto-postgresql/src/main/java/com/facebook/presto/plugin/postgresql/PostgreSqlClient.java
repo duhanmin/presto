@@ -17,10 +17,17 @@ import com.facebook.presto.plugin.jdbc.BaseJdbcClient;
 import com.facebook.presto.plugin.jdbc.BaseJdbcConfig;
 import com.facebook.presto.plugin.jdbc.DriverConnectionFactory;
 import com.facebook.presto.plugin.jdbc.JdbcConnectorId;
+import com.facebook.presto.plugin.jdbc.JdbcTypeHandle;
+import com.facebook.presto.plugin.jdbc.ReadMapping;
+import com.facebook.presto.plugin.jdbc.StandardReadMappings;
+import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.type.CharType;
+import com.facebook.presto.spi.type.Decimals;
 import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.spi.type.VarcharType;
 import org.postgresql.Driver;
 
 import javax.inject.Inject;
@@ -30,10 +37,18 @@ import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Types;
+import java.util.Optional;
 
 import static com.facebook.presto.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.ALREADY_EXISTS;
+import static com.facebook.presto.spi.type.CharType.createCharType;
+import static com.facebook.presto.spi.type.DecimalType.createDecimalType;
 import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
+import static com.facebook.presto.spi.type.VarcharType.createUnboundedVarcharType;
+import static com.facebook.presto.spi.type.VarcharType.createVarcharType;
+import static java.lang.Math.max;
+import static java.lang.Math.min;
 import static java.lang.String.format;
 
 public class PostgreSqlClient
@@ -45,6 +60,12 @@ public class PostgreSqlClient
     public PostgreSqlClient(JdbcConnectorId connectorId, BaseJdbcConfig config)
     {
         super(connectorId, config, "\"", new DriverConnectionFactory(new Driver(), config));
+    }
+
+    @Override
+    public Optional<ReadMapping> toPrestoType(ConnectorSession session, JdbcTypeHandle typeHandle)
+    {
+        return jdbcTypeToPrestoType(typeHandle);
     }
 
     @Override
@@ -108,5 +129,83 @@ public class PostgreSqlClient
         catch (SQLException e) {
             throw new PrestoException(JDBC_ERROR, e);
         }
+    }
+
+    public static Optional<ReadMapping> jdbcTypeToPrestoType(JdbcTypeHandle type)
+    {
+        boolean boolNumeric = true;
+        int columnSize = type.getColumnSize();
+        switch (type.getJdbcType()) {
+            case Types.BIT:
+            case Types.BOOLEAN:
+                return Optional.of(StandardReadMappings.booleanReadMapping());
+
+            case Types.TINYINT:
+                return Optional.of(StandardReadMappings.tinyintReadMapping());
+
+            case Types.SMALLINT:
+                return Optional.of(StandardReadMappings.smallintReadMapping());
+
+            case Types.INTEGER:
+                return Optional.of(StandardReadMappings.integerReadMapping());
+
+            case Types.BIGINT:
+                return Optional.of(StandardReadMappings.bigintReadMapping());
+
+            case Types.REAL:
+                return Optional.of(StandardReadMappings.realReadMapping());
+
+            case Types.FLOAT:
+            case Types.DOUBLE:
+                return Optional.of(StandardReadMappings.doubleReadMapping());
+
+            case Types.NUMERIC:
+            case Types.DECIMAL:
+                int decimalDigits = type.getDecimalDigits();
+                int precision = columnSize + max(-decimalDigits, 0); // Map decimal(p, -s) (negative scale) to decimal(p+s, 0).
+                if (precision > Decimals.MAX_PRECISION) {
+                    break;
+                }
+                boolNumeric = false;
+                return Optional.of(StandardReadMappings.decimalReadMapping(createDecimalType(precision, max(decimalDigits, 0))));
+
+            case Types.CHAR:
+            case Types.NCHAR:
+                // TODO this is wrong, we're going to construct malformed Slice representation if source > charLength
+                int charLength = min(columnSize, CharType.MAX_LENGTH);
+                return Optional.of(StandardReadMappings.charReadMapping(createCharType(charLength)));
+
+            case Types.VARCHAR:
+            case Types.NVARCHAR:
+            case Types.LONGVARCHAR:
+            case Types.LONGNVARCHAR:
+                if (columnSize > VarcharType.MAX_LENGTH) {
+                    return Optional.of(StandardReadMappings.varcharReadMapping(createUnboundedVarcharType()));
+                }
+                return Optional.of(StandardReadMappings.varcharReadMapping(createVarcharType(columnSize)));
+
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY:
+                return Optional.of(StandardReadMappings.varbinaryReadMapping());
+
+            case Types.DATE:
+                return Optional.of(StandardReadMappings.dateReadMapping());
+
+            case Types.TIME:
+                return Optional.of(StandardReadMappings.timeReadMapping());
+
+            case Types.TIMESTAMP:
+                return Optional.of(StandardReadMappings.timestampReadMapping());
+        }
+
+        if (boolNumeric) {
+            switch (type.getJdbcType()) {
+                case Types.NUMERIC:
+                    return Optional.of(StandardReadMappings.doubleReadMapping());
+            }
+        }
+
+        return Optional.empty();
     }
 }
